@@ -1,8 +1,10 @@
 /bin
 /obj
+/build*
 
 *.o
 *.obj
 *.exe
 *.depend
 *.layout
+.DS_Store

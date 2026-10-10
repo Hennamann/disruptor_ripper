@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disruptor Level Viewer</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0d10; --panel: rgba(16,20,26,.88); --fg: #e6e9ee; --muted: #9aa3ad; --accent: #4ad66d; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; z-index: 20; top: 12px; left: 12px; width: 240px; max-height: calc(100% - 24px); overflow: auto; background: var(--panel); border: 1px solid #2a313b; border-radius: 10px; padding: 12px 14px; backdrop-filter: blur(6px); }
+  #panel h1 { font-size: 14px; margin: 0 0 8px; letter-spacing: .02em; }
+  #panel label { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: pointer; }
+  #panel select, #panel input[type=range] { width: 100%; }
+  #panel .sec { margin-top: 10px; padding-top: 8px; border-top: 1px solid #2a313b; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  #help { position: fixed; left: 12px; bottom: 12px; color: var(--muted); font-size: 12px; background: var(--panel); padding: 8px 12px; border-radius: 8px; border: 1px solid #2a313b; }
+  #status { position: fixed; right: 12px; top: 12px; color: var(--muted); font-size: 12px; background: var(--panel); padding: 8px 12px; border-radius: 8px; border: 1px solid #2a313b; max-width: 320px; }
+  #map { position: fixed; right: 12px; bottom: 12px; max-width: 34vw; max-height: 34vh; border: 1px solid #2a313b; border-radius: 8px; background: #000; image-rendering: pixelated; display: none; }
+  #click { position: fixed; z-index: 10; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 14px 22px; font-size: 16px; color: var(--fg); background: var(--panel); border: 1px solid #2a313b; border-radius: 10px; cursor: pointer; pointer-events: none; }
+  #help, #status, #map { z-index: 20; }
+  #click.hidden { display: none; }
+  kbd { background: #222932; border: 1px solid #3a4452; border-radius: 4px; padding: 0 5px; font: 11px monospace; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="panel">
+  <h1>Disruptor level viewer</h1>
+  <select id="level"></select>
+  <div class="sec">Rendering</div>
+  <label><input type="checkbox" id="textures" checked> Textures</label>
+  <label><input type="checkbox" id="vcolors" checked> Vertex lighting</label>
+  <label><input type="checkbox" id="wire"> Wireframe</label>
+  <label><input type="checkbox" id="sky" checked> Sky panorama</label>
+  <label><input type="checkbox" id="fog" checked> Fog</label>
+  <div class="sec">Objects</div>
+  <label><input type="checkbox" id="enemies" checked> Enemies / objects</label>
+  <label><input type="checkbox" id="items" checked> Items</label>
+  <label><input type="checkbox" id="waypoints"> AI waypoints</label>
+  <label><input type="checkbox" id="hidden"> Toggleable meshes (doors etc.)</label>
+  <label><input type="checkbox" id="mapov" checked> Map overlay</label>
+  <div class="sec">Movement</div>
+  <label>Speed <input type="range" id="speed" min="5" max="200" value="60"></label>
+  <label><input type="checkbox" id="noclip" checked> Fly (no gravity)</label>
+</div>
+<div id="status">Loading…</div>
+<img id="map" alt="automap">
+<div id="help"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Space</kbd>/<kbd>Shift</kbd> up/down · mouse look · <kbd>R</kbd> return to start · <kbd>Esc</kbd> release mouse</div>
+<div id="click">Click the view to look around · Esc releases the mouse</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const status = msg => { $('status').textContent = msg; };
+
+  // ---------------------------------------------------------------- scene
+  const canvas = $('view');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0d10);
+  const camera = new THREE.PerspectiveCamera(75, 1, 0.2, 4000);
+  const level = new THREE.Group();     // everything belonging to the loaded level
+  scene.add(level);
+  let skyMesh = null, startPos = new THREE.Vector3(0, 10, 0), groups = { solid: [], hidden: [], enemies: [], items: [], waypoints: [] };
+
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------------------------------------------------------------- controls
+  const keys = {};
+  let yaw = 0, pitch = 0;
+  addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'KeyR') { camera.position.copy(startPos); yaw = 0; pitch = 0; } });
+  addEventListener('keyup', e => { keys[e.code] = false; });
+  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  document.addEventListener('pointerlockchange', () => { $('click').classList.toggle('hidden', document.pointerLockElement === canvas); });
+  document.addEventListener('mousemove', e => {
+    if (document.pointerLockElement !== canvas) return;
+    yaw -= e.movementX * 0.0025;
+    pitch = Math.max(-1.5, Math.min(1.5, pitch - e.movementY * 0.0025));
+  });
+
+  // ---------------------------------------------------------------- helpers
+  const texLoader = new THREE.TextureLoader();
+  const texCache = {};
+  function pixelTexture(url) {
+    if (!texCache[url]) {
+      const t = texLoader.load(url);
+      t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter; t.generateMipmaps = false;
+      texCache[url] = t;
+    }
+    return texCache[url];
+  }
+  async function fetchText(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ': ' + r.status); return r.text(); }
+  async function exists(url) { try { const r = await fetch(url, { method: 'HEAD' }); return r.ok; } catch { return false; } }
+  function parseCsv(text) {
+    return text.split('\n').filter(l => l.trim() && !l.startsWith('#')).map(l => l.split(',').map(s => s.trim()));
+  }
+
+  // OBJ parser for the ripper's output: v x y z r g b, vt, f a/t b/t c/t [d/t], usemtl, g name_visXX
+  function parseObj(text, dir) {
+    const v = [], c = [], vt = [];
+    const buckets = {};     // key: material|hidden -> { pos, uv, col }
+    let mtl = 'none', hidden = false;
+    const bucket = () => {
+      const k = mtl + '|' + (hidden ? 1 : 0);
+      return buckets[k] || (buckets[k] = { mtl, hidden, pos: [], uv: [], col: [] });
+    };
+    for (const line of text.split('\n')) {
+      const p = line.split(' ');
+      switch (p[0]) {
+        case 'v': v.push(+p[1], +p[2], +p[3]); c.push(p.length >= 7 ? +p[4] : 1, p.length >= 7 ? +p[5] : 1, p.length >= 7 ? +p[6] : 1); break;
+        case 'vt': vt.push(+p[1], +p[2]); break;
+        case 'usemtl': mtl = p[1]; break;
+        case 'g': hidden = !/_visff$/.test(p[1]); break;
+        case 'f': {
+          const idx = p.slice(1).map(s => { const [a, b] = s.split('/'); return [(+a) - 1, b ? (+b) - 1 : 0]; });
+          const tris = idx.length === 4 ? [[0, 1, 2], [0, 2, 3]] : [[0, 1, 2]];
+          const b = bucket();
+          for (const t of tris) for (const i of t) {
+            const [vi, ti] = idx[i];
+            b.pos.push(v[vi * 3], v[vi * 3 + 1], v[vi * 3 + 2]);
+            b.col.push(c[vi * 3] * 2, c[vi * 3 + 1] * 2, c[vi * 3 + 2] * 2);   // PS1 0x80 = neutral
+            b.uv.push(vt[ti * 2] || 0, vt[ti * 2 + 1] || 0);
+          }
+        }
+      }
+    }
+    const meshes = [];
+    for (const k in buckets) {
+      const b = buckets[k];
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+      g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
+      const m = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, vertexColors: true, alphaTest: 0.5 });
+      if (b.mtl !== 'none') m.map = pixelTexture(dir + 'textures/' + b.mtl + '.png');
+      m.userData.map = m.map;
+      const mesh = new THREE.Mesh(g, m);
+      mesh.userData.hidden = b.hidden;
+      meshes.push(mesh);
+    }
+    return meshes;
+  }
+
+  function labelSprite(text, color) {
+    const cv = document.createElement('canvas'); cv.width = 64; cv.height = 64;
+    const g = cv.getContext('2d');
+    g.fillStyle = color; g.beginPath(); g.arc(32, 32, 22, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#000'; g.font = 'bold 26px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 32, 34);
+    const t = new THREE.CanvasTexture(cv);
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: true }));
+    s.scale.set(12, 12, 1);
+    return s;
+  }
+
+  // ---------------------------------------------------------------- level loading
+  function clearLevel() {
+    while (level.children.length) level.remove(level.children[0]);
+    groups = { solid: [], hidden: [], enemies: [], items: [], waypoints: [] };
+    skyMesh = null;
+  }
+
+  async function loadLevel(num) {
+    clearLevel();
+    const dir = 'Level ' + num + '/';
+    status('Loading level ' + num + '…');
+    try {
+      const obj = await fetchText(dir + 'level_' + num + '.obj');
+      for (const m of parseObj(obj, dir)) { level.add(m); (m.userData.hidden ? groups.hidden : groups.solid).push(m); }
+    } catch (e) { status('Could not load ' + dir + ': run a local web server in the Levels folder (python3 -m http.server)'); return; }
+
+    // player start
+    try {
+      const info = await fetchText(dir + 'level_info.txt');
+      const m = /start_obj:\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/.exec(info);
+      if (m) startPos.set(+m[1], +m[2] + 2, +m[3]);
+    } catch { startPos.set(0, 10, 0); }
+    camera.position.copy(startPos); yaw = 0; pitch = 0;
+
+    // sky panorama (1280 texels = full turn) as a cylinder that follows the camera
+    if (await exists(dir + 'sky.png')) {
+      const t = pixelTexture(dir + 'sky.png'); t.wrapS = THREE.RepeatWrapping; t.repeat.x = -1;
+      const geo = new THREE.CylinderGeometry(1500, 1500, 560, 48, 1, true);
+      skyMesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: t, side: THREE.BackSide, fog: false, depthWrite: false }));
+      skyMesh.renderOrder = -1;
+      level.add(skyMesh);
+    }
+
+    // enemies / objects: obj_x obj_y obj_z columns 4..6, class column 12
+    try {
+      for (const r of parseCsv(await fetchText(dir + 'entities.txt'))) {
+        const s = labelSprite(r[12] ?? '?', '#ff5a5a');
+        s.position.set(+r[4], +r[5] + 14, +r[6]);
+        s.userData.info = 'entity ' + r[0] + ' class ' + r[12] + '/' + r[13] + ' set ' + r[8];
+        level.add(s); groups.enemies.push(s);
+      }
+    } catch {}
+    // items: image item_type_NN.png when present, name in column 9
+    try {
+      for (const r of parseCsv(await fetchText(dir + 'items.txt'))) {
+        const type = r[7].padStart(2, '0');
+        const url = dir + 'item_type_' + type + '.png';
+        const mat = new THREE.SpriteMaterial({ map: pixelTexture(url), alphaTest: 0.5 });
+        const s = new THREE.Sprite(mat);
+        s.scale.set(10, 10, 1);
+        s.position.set(+r[4], +r[5] + 5, +r[6]);
+        level.add(s); groups.items.push(s);
+      }
+    } catch {}
+    // waypoints: spheres plus link lines
+    try {
+      const rows = parseCsv(await fetchText(dir + 'waypoints.txt'));
+      const pts = rows.map(r => new THREE.Vector3(+r[4], +r[5] + 1, +r[6]));
+      const sg = new THREE.SphereGeometry(2, 8, 6), sm = new THREE.MeshBasicMaterial({ color: 0x4ad6ff });
+      const lines = [];
+      rows.forEach((r, i) => {
+        const s = new THREE.Mesh(sg, sm); s.position.copy(pts[i]); level.add(s); groups.waypoints.push(s);
+        for (let k = 9; k <= 12; ++k) { const j = +r[k]; if (j !== 255 && j < pts.length) lines.push(pts[i], pts[j]); }
+      });
+      const lg = new THREE.BufferGeometry().setFromPoints(lines);
+      const l = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x4ad6ff }));
+      level.add(l); groups.waypoints.push(l);
+    } catch {}
+    // map overlay
+    $('map').src = dir + 'map_' + num + '.png';
+    applyToggles();
+    status('Level ' + num + ': ' + groups.solid.length + ' material groups, ' + groups.enemies.length + ' entities, ' + groups.items.length + ' items');
+  }
+
+  // ---------------------------------------------------------------- toggles
+  function applyToggles() {
+    const tex = $('textures').checked, vc = $('vcolors').checked, wire = $('wire').checked;
+    for (const m of groups.solid.concat(groups.hidden)) {
+      m.material.map = tex ? m.material.userData.map : null;
+      m.material.vertexColors = vc;
+      m.material.wireframe = wire;
+      m.material.color.set(tex || vc ? 0xffffff : 0x9aa3ad);
+      m.material.needsUpdate = true;
+    }
+    for (const m of groups.hidden) m.visible = $('hidden').checked;
+    for (const m of groups.enemies) m.visible = $('enemies').checked;
+    for (const m of groups.items) m.visible = $('items').checked;
+    for (const m of groups.waypoints) m.visible = $('waypoints').checked;
+    if (skyMesh) skyMesh.visible = $('sky').checked;
+    scene.fog = $('fog').checked ? new THREE.Fog(0x0b0d10, 150, 900) : null;
+    $('map').style.display = $('mapov').checked ? 'block' : 'none';
+  }
+  for (const id of ['textures', 'vcolors', 'wire', 'sky', 'fog', 'enemies', 'items', 'waypoints', 'hidden', 'mapov']) $(id).addEventListener('change', applyToggles);
+
+  // ---------------------------------------------------------------- level list
+  async function buildLevelList() {
+    const sel = $('level');
+    for (let i = 1; i <= 15; ++i) {
+      const n = String(i).padStart(2, '0');
+      if (await exists('Level ' + n + '/level_' + n + '.obj')) {
+        const o = document.createElement('option'); o.value = n; o.textContent = 'Level ' + n; sel.appendChild(o);
+      }
+    }
+    sel.addEventListener('change', () => loadLevel(sel.value));
+    if (sel.options.length) loadLevel(sel.options[0].value);
+    else status('No levels found next to this page. Put viewer.html in the Levels folder and serve it with a local web server.');
+  }
+
+  // ---------------------------------------------------------------- loop
+  const clock = new THREE.Clock();
+  const dir = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
+  function tick() {
+    const dt = Math.min(clock.getDelta(), 0.1), speed = +$('speed').value;
+    camera.rotation.set(0, 0, 0); camera.rotateY(yaw); camera.rotateX(pitch);
+    camera.getWorldDirection(dir);
+    if (!$('noclip').checked) { dir.y = 0; dir.normalize(); }
+    right.crossVectors(dir, up).normalize();
+    const v = new THREE.Vector3();
+    if (keys.KeyW) v.add(dir); if (keys.KeyS) v.sub(dir);
+    if (keys.KeyD) v.add(right); if (keys.KeyA) v.sub(right);
+    if (keys.Space) v.y += 1; if (keys.ShiftLeft || keys.ShiftRight) v.y -= 1;
+    if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), speed * dt);
+    if (skyMesh) skyMesh.position.copy(camera.position);
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+  buildLevelList();
+  tick();
+})();
+</script>
+</body>
+</html>
