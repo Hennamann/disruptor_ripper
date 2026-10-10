@@ -1,6 +1,7 @@
 /bin
 /obj
 /build*
+/refs
 
 *.o
 *.obj
@@ -8,3 +9,4 @@
 *.depend
 *.layout
 .DS_Store
+.mcp.json
